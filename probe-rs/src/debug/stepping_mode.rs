@@ -49,20 +49,11 @@ impl SteppingMode {
             }
         };
 
-        // First deal with the two special cases.
-        match self {
-            SteppingMode::StepInstruction => {
-                program_counter = core.step()?.pc;
-                core_status = core.status()?;
-                return Ok((core_status, program_counter));
-            }
-            SteppingMode::IntoStatement => {
-                // Step a single instruction, then proceed to the next step.
-                program_counter = core.step()?.pc;
-            }
-            _ => {
-                // We will deal with the rest in the next step.
-            }
+        // First deal with the the fast/easy case.
+        if matches!(self, SteppingMode::StepInstruction) {
+            program_counter = core.step()?.pc;
+            core_status = core.status()?;
+            return Ok((core_status, program_counter));
         }
 
         let mut target_address: Option<u64> = None;
@@ -76,7 +67,7 @@ impl SteppingMode {
             ) {
                 Ok(program_row_data) => {
                     match self {
-                        SteppingMode::OverStatement => {
+                        SteppingMode::OverStatement | SteppingMode::IntoStatement => {
                             target_address = program_row_data.next_statement_address
                         }
                         SteppingMode::OutOfStatement => {
@@ -89,10 +80,6 @@ impl SteppingMode {
                             } else {
                                 target_address = program_row_data.step_out_address
                             }
-                        }
-                        SteppingMode::IntoStatement => {
-                            // We have already stepped a single instruction, now use the next available breakpoint.
-                            target_address = program_row_data.first_halt_address
                         }
                         _ => {
                             // We've already covered SteppingMode::StepInstruction
