@@ -14,6 +14,7 @@ use super::{DebugError, DebugInfo, SourceLocation};
 ///   - The beginning of a statement that is neither inside the prologue, nor inside the epilogue.
 /// - Based on this, we will attempt to fill the [`HaltLocations`] struct with as many of the four fields as possible, given the available information in the instruction sequence.
 /// All data is calculated using the `gimli::read::CompletedLineProgram` as well as, function call data from the debug info frame section.
+/// NOTE: Sometimes the target program_counter is at a location where the debug_info program row data does not contain valid statements for halt points, and we will return a DebugError::NoValidHaltLocation . In this case, we recommend the consumer of this API step the core to the next instruction and try again, with a resasonable retry limit.
 #[derive(Debug)]
 pub struct HaltLocations {
     /// For when we are trying to determine a 'source breakpoint', this is the first valid statement past the program counter, where we can set a breakpoint.
@@ -88,7 +89,7 @@ impl HaltLocations {
             // - At this point, the program_counter register is no longer inside the code of the sequence.
             // - IMPORTANT: Because of the above, we will NOT allow a breakpoint, or a step target to be on a statement that is a row.end_sequence()
 
-            // Set the first_breakpoint_address
+            // PART 1: Set the first_breakpoint_address
             if program_row_data.first_halt_address.is_none() && row.address() >= program_counter {
                 if row.end_sequence() {
                     // If the first non-prologue row is a end of sequence, then we cannot determine valid halt addresses at this program counter.
@@ -115,44 +116,6 @@ impl HaltLocations {
                             });
                         }
                     }
-
-                    // This is a safe time to determine the step_out_statement.
-                    // Recursive calls will sometimes need to use a return_address as a program_counter, in which case we skip this part.
-                    if return_address.is_some() {
-                        if let Ok(function_dies) =
-                            program_unit.get_function_dies(program_counter, None, true)
-                        {
-                            for function in function_dies {
-                                if function.low_pc <= program_counter as u64
-                                    && function.high_pc > program_counter as u64
-                                {
-                                    if function.is_inline() {
-                                        // Step_out_address for inlined functions, is the first available breakpoint address after the last statement in this function.
-                                        program_row_data.step_out_address = HaltLocations::new(
-                                            debug_info,
-                                            function.high_pc,
-                                            return_address,
-                                        )?
-                                        .first_halt_address;
-                                    } else if function
-                                        .get_attribute(gimli::DW_AT_noreturn)
-                                        .is_some()
-                                    {
-                                        // Cannot step out of non returning functions.
-                                    } else if program_row_data.step_out_address.is_none() {
-                                        // Step_out_address for non-inlined functions is the first available breakpoint address after the return address.
-                                        program_row_data.step_out_address = return_address
-                                            .and_then(|return_address| {
-                                                HaltLocations::new(debug_info, return_address, None)
-                                                    .map_or(None, |valid_halt_locations| {
-                                                        valid_halt_locations.first_halt_address
-                                                    })
-                                            });
-                                    }
-                                }
-                            }
-                        };
-                    }
                     // We can move to the next row until we find the next_statement_address.
                     continue;
                 } else {
@@ -160,13 +123,14 @@ impl HaltLocations {
                 }
             }
 
-            // Set the next_statement_address
+            // PART 2: Set the next_statement_address
             if program_row_data.first_halt_address.is_some()
                 && program_row_data.next_statement_address.is_none()
                 && row.address() > program_counter
             {
                 if row.end_sequence() {
                     // If the next row is a end of sequence, then we cannot determine valid halt addresses at this program counter.
+                    // TODO: A logical next step would then be to set the next_statement_address to be the same as the step_out_address.
                     return Err(DebugError::NoValidHaltLocation{
                             message: "This function does not have any additional halt locations. Please consider using instruction level stepping.".to_string(),
                             pc_at_error: program_counter,
@@ -181,8 +145,56 @@ impl HaltLocations {
                 }
             }
         }
-        // TODO: Handle the case where we have no next_statement_address.
-        Ok(program_row_data)
+
+        // PART 3: In the unlikely scenario that we encounter a sequence of statements that complete before we encounter `row.prologue_end()`, then we will arrive at this point with no halt location information.
+        if program_row_data.first_halt_address.is_none() {
+            Err(DebugError::NoValidHaltLocation{
+                message: "This function does not have any valid halt locations. Please consider using instruction level stepping.".to_string(),
+                pc_at_error: program_counter,
+            })
+        } else {
+            // PART 4: This is a safe time to determine the step_out_address.
+            if return_address.is_none() {
+                // When setting breakpoints, the call to this function will use None as the return address, because we don't need to calculate the 'step_out' address for breakpoints.
+                // Similarly, if we need to make a recursive call to HaltLocation::new() then that we will use the incoming return_address as a program_counter.
+                // TODO: In those cases, make sure we set an appropriate HaltLocations::step_out_address
+            } else if let Ok(function_dies) =
+                program_unit.get_function_dies(program_counter, None, true)
+            {
+                // We want the first qualifying (PC is in range) function from the back of this list.
+                for function in function_dies.iter().rev() {
+                    if function.low_pc <= program_counter as u64
+                        && function.high_pc > program_counter as u64
+                    {
+                        if function.is_inline() {
+                            // Step_out_address for inlined functions, is the first available breakpoint address after the last statement in this function.
+                            program_row_data.step_out_address =
+                                HaltLocations::new(debug_info, function.high_pc, return_address)?
+                                    .first_halt_address;
+                        } else if function.get_attribute(gimli::DW_AT_noreturn).is_some() {
+                            // Cannot step out of non returning functions.
+                            println!(
+                                "Found DW_AT_noreturn option called {:?}",
+                                function.function_name()
+                            );
+                        } else if program_row_data.step_out_address.is_none() {
+                            // Step_out_address for non-inlined functions is the first available breakpoint address after the return address.
+                            program_row_data.step_out_address =
+                                return_address.and_then(|return_address| {
+                                    HaltLocations::new(debug_info, return_address, None).map_or(
+                                        None,
+                                        |valid_halt_locations| {
+                                            valid_halt_locations.first_halt_address
+                                        },
+                                    )
+                                });
+                        }
+                    }
+                }
+            }
+
+            Ok(program_row_data)
+        }
     }
 }
 
